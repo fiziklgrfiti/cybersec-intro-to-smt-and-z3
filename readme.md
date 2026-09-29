@@ -74,11 +74,11 @@ The engine processes the six NIST CSF 2.0 PR.AA outcomes (Identity Management, A
          ▼  Stage 0
   Display source requirements as published
          │
-         ▼  Stage 1  [LLM — Claude API]
-  Rewrite each outcome into structured SHALL statements
-  with subject, object, condition, and testable indicator
+         ▼  Stage 1  [LLM — OpenCode agent OR Claude API]
+   Rewrite each outcome into structured SHALL statements
+   with subject, object, condition, and testable indicator
          │
-         ▼  Stage 2  [LLM — Claude API]
+         ▼  Stage 2  [LLM — OpenCode agent OR Claude API]
   Translate each rewritten requirement into:
     (a) Pseudo-logic  ∀ e ∈ Entity: has_credentials(e) → credentials_managed(e)
     (b) SMT-LIB2      (assert (forall ((e Entity)) (=> (has-credentials e) ...)))
@@ -238,8 +238,7 @@ Read these carefully. Before you look at the analysis, try to identify: Which te
 ## 7. Stage 1 — LLM Requirement Rewriting
 
 **File:** `skills/skill_01_rewriter.py`
-**Dependency:** Claude API (`ANTHROPIC_API_KEY`)
-**Input:** `data/requirements.py`
+**Dependency:** LLM — via `ANTHROPIC_API_KEY` (direct API path) or OpenCode agent (`--from-files`)
 **Output:** A list of JSON objects, one per requirement
 
 ### What the LLM does
@@ -288,8 +287,7 @@ The rewriting is not perfect — LLMs introduce their own assumptions. Stage 3 w
 ## 8. Stage 2 — Formal Representation
 
 **File:** `skills/skill_02_formalizer.py`
-**Dependency:** Claude API (`ANTHROPIC_API_KEY`)
-**Input:** Output of Stage 1 (rewritten SHALL statements)
+**Dependency:** LLM — via `ANTHROPIC_API_KEY` (direct API path) or OpenCode agent (`--from-files`)
 **Output:** Two formal representations per requirement — pseudo-logic and SMT-LIB2
 
 All six requirements are sent to Claude in a single API call. This matters because formal logic requires consistent naming — if PR.AA-01 introduces a predicate called `has_credentials` and PR.AA-02 also talks about credentials, both must use the same predicate name. Sending all requirements together allows the model to maintain that consistency.
@@ -575,7 +573,7 @@ The finding type is determined by what the check is testing. A SAT result is som
 ### Prerequisites
 
 - Python 3.11 or later
-- An Anthropic API key (for Stages 1 and 2 only)
+- An Anthropic API key — **optional**; only required for the direct API path (`python run.py` with `ANTHROPIC_API_KEY` set). Not needed when using OpenCode or the `--no-llm` offline mode.
 
 ### Install
 
@@ -585,15 +583,25 @@ cd requirements-engine
 pip install -r requirements.txt
 ```
 
-### Set your API key
+### Run via OpenCode (preferred — no API key required)
+
+If you are using OpenCode (GitHub Copilot, or any other configured model),
+the agent performs stages 1 and 2 itself. Load the `run-pipeline` skill or
+follow these steps:
+
+1. Ask the agent to run the pipeline. It will apply the prompts from
+   `skills/skill_01_rewriter.py` and `skills/skill_02_formalizer.py` using
+   its own model, and write intermediate JSON to `.opencode/pipeline/`.
+2. Once the agent has produced both output files, run stage 3:
+
+```bash
+python run.py --from-files
+```
+
+### Run via direct API (requires ANTHROPIC_API_KEY)
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-### Run the full pipeline
-
-```bash
 python run.py
 ```
 
@@ -607,10 +615,12 @@ python run.py --no-llm
 
 ### Run a single skill
 
-Each skill is independently executable. Skills 1 and 2 require an API key. Skill 3 has no external dependencies beyond `z3-solver`.
+Each skill is independently executable. Skills 1 and 2 require `ANTHROPIC_API_KEY`
+when run standalone (they call the Anthropic SDK directly). Skill 3 has no
+external dependencies beyond `z3-solver`.
 
 ```bash
-# Stage 1 only: LLM rewriting
+# Stage 1 only: LLM rewriting (requires ANTHROPIC_API_KEY)
 python skills/skill_01_rewriter.py
 
 # Stage 2 only: formal logic generation (runs Stage 1 automatically as prerequisite)
@@ -620,9 +630,11 @@ python skills/skill_02_formalizer.py
 python skills/skill_03_smt_solver.py
 ```
 
-### Claude Code orchestration
+### OpenCode / agent orchestration
 
-If you are using Claude Code (the CLI agent), the `AGENT.md` file contains full instructions for orchestrating the pipeline. Claude Code can run individual skills, add new requirements, add new Z3 checks, and swap in different NIST categories.
+The `AGENT.md` file contains full instructions for orchestrating the pipeline
+via an AI agent. The `.opencode/skills/run-pipeline/` skill documents the
+preferred OpenCode-native workflow in detail.
 
 ---
 
@@ -633,15 +645,15 @@ requirements-engine/
 │
 ├── run.py
 │     Orchestrator. Calls Stages 0–3 in sequence.
-│     Accepts --no-llm flag to skip API calls.
+│     Accepts --no-llm (offline stubs), --from-files (OpenCode-native path).
 │     Entry point for the full pipeline.
 │
 ├── AGENT.md
-│     Claude Code agent instructions.
+│     OpenCode agent instructions.
 │     Describes tasks, extension patterns, command reference.
 │
 ├── requirements.txt
-│     anthropic>=0.25.0   — Claude API client
+│     anthropic>=0.25.0   — Claude API client (direct API path only)
 │     z3-solver>=4.12.0   — Z3 SMT solver Python bindings
 │
 ├── data/
@@ -651,23 +663,27 @@ requirements-engine/
 │
 ├── skills/
 │   ├── skill_01_rewriter.py
-│   │     Calls Claude API with a structured system prompt.
+│   │     Calls Claude API (direct path) with a structured system prompt.
 │   │     Returns: list of rewritten requirement dicts (JSON).
-│   │     System prompt enforces: SHALL statements, five required fields,
-│   │     JSON-only output, atomic conditions.
+│   │     Also writes output to .opencode/pipeline/stage1_output.json.
 │   │
 │   ├── skill_02_formalizer.py
-│   │     Calls Claude API with all rewritten requirements in one call
+│   │     Calls Claude API (direct path) with all rewritten requirements in one call
 │   │     (to ensure consistent predicate naming across requirements).
-│   │     Returns: list of formal representation dicts, each with
-│   │     pseudo_logic, smt_lib2, sorts_used, predicates_used.
+│   │     Also writes output to .opencode/pipeline/stage2_output.json.
 │   │
 │   └── skill_03_smt_solver.py
 │         build_model(): declares sorts, predicates, and six axioms using Z3 Python API.
 │         check_01 – check_06: individual proof functions, each returning a finding dict.
 │         run(): executes all checks, optionally displaying SMT-LIB2 reference.
-│         CHECKS list: controls which checks run and in what order.
-│         CHECK_REQUIREMENT_MAP: maps each check to its PR.AA scope for display.
+│
+├── .opencode/
+│   ├── skills/run-pipeline/
+│   │     OpenCode skill: full pipeline workflow for agent-native execution.
+│   │
+│   └── pipeline/                         (gitignored — generated at runtime)
+│       ├── stage1_output.json            produced by agent or skill_01 direct run
+│       └── stage2_output.json            produced by agent or skill_02 direct run
 │
 └── utils/
     └── terminal.py

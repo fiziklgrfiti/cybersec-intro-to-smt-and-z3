@@ -2,89 +2,215 @@
 skills/skill_03_smt_solver.py — STAGE 3: SMT Solving with Z3
 ──────────────────────────────────────────────────────────────
 Runs automated reasoning proofs against a formal model of the
-NIST PR.AA requirements using the Z3 SMT solver (Python API).
+selected NIST requirements using the Z3 SMT solver (Python API).
 
-The model encodes six requirement axioms and runs six targeted
-checks designed to surface:
-  • Global consistency   (are the requirements contradictory?)
-  • Gaps                 (missing links between requirements)
-  • Ambiguities          (undefined or unconstrained terms)
-  • Implication chains   (what does "access" truly guarantee?)
+Two model-building paths:
 
-NOTE: The formal model here is intentionally crafted to produce
-educational findings. The SMT-LIB2 output from skill_02 is
-displayed for learning; the Z3 Python API runs the actual proofs.
+  build_model(formal)
+      Production path.  Parses the SMT-LIB2 strings produced by
+      skill_02_formalizer and constructs Z3 axioms from them.
+      Used by run.py --from-files and the Stage 4 feedback loop.
+      Gaps that are properly closed in the Stage 1/2 artefacts are
+      confirmed closed by Z3 in the same pass.
 
-Can be run standalone:
+  build_reference_model()
+      Regression/standalone path.  Hard-coded axioms mirroring the
+      six NIST PR.AA requirements as published.  Used only when this
+      file is executed directly (python skills/skill_03_smt_solver.py)
+      so the solver can be exercised in isolation without pipeline
+      artefacts.  Not used in any end-to-end or production run.
+
+Checks are scoped to the selected requirements:
+
+  CHECK_REQUIREMENT_MAP maps each check function to the frozenset of
+  requirement IDs that must all be in scope for the check to run.
+  run() accepts selected_req_ids and filters accordingly.
+
+  check_00_requirement_consistency always runs regardless of scope —
+  it tests internal consistency of the axioms derived from whatever
+  requirements the user selected.
+
+Can be run standalone (uses build_reference_model, all checks):
     python skills/skill_03_smt_solver.py
 """
 
 import os
 import sys
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.terminal import (
-    c, BOLD, CYAN, DIM, YELLOW, GREEN, RED, MAGENTA, WHITE,
+    c, BOLD, CYAN, DIM, YELLOW, GREEN, RED, WHITE,
     print_stage, print_finding, print_smt_block, rule,
 )
 
 try:
     from z3 import (
         DeclareSort, Function, BoolSort, Const, ForAll, Implies,
-        And, Or, Not, Solver, sat, unsat, unknown,
+        And, Not, Solver, sat, unsat, parse_smt2_string,
     )
 except ImportError:
     print("z3-solver not installed. Run:  pip install z3-solver")
     sys.exit(1)
 
 
-# ── Domain model ───────────────────────────────────────────────────────────────
-def build_model():
+# ── Canonical sorts ────────────────────────────────────────────────────────────
+# Declared once at module level so every model-building path and every check
+# function shares the same Z3 sort objects.  Z3 treats each DeclareSort("X")
+# call as a new distinct sort, so module-level constants are required for
+# unification across axiom sets.
+Entity = DeclareSort("Entity")
+Asset  = DeclareSort("Asset")
+Duty   = DeclareSort("Duty")
+
+
+# ── Canonical predicate declarations ──────────────────────────────────────────
+# These mirror the vocabulary enforced by skill_02_formalizer.py's SYSTEM_PROMPT.
+# Declared once at module level and reused by both model-building paths so that
+# check functions always hold references to the same Z3 function objects,
+# regardless of which path built the axioms.
+
+# Entity → Bool
+has_credentials          = Function("has_credentials",          Entity, BoolSort())
+credentials_managed      = Function("credentials_managed",      Entity, BoolSort())
+identity_proofed         = Function("identity_proofed",         Entity, BoolSort())
+identity_bound           = Function("identity_bound",           Entity, BoolSort())
+is_authenticated         = Function("is_authenticated",         Entity, BoolSort())
+assertion_protected      = Function("assertion_protected",      Entity, BoolSort())
+assertion_verified       = Function("assertion_verified",       Entity, BoolSort())
+
+# Entity × Asset → Bool
+has_access               = Function("has_access",               Entity, Asset, BoolSort())
+access_authorized        = Function("access_authorized",        Entity, Asset, BoolSort())
+access_in_policy         = Function("access_in_policy",         Entity, Asset, BoolSort())
+least_privilege_applied  = Function("least_privilege_applied",  Entity, Asset, BoolSort())
+sep_of_duties_applied    = Function("sep_of_duties_applied",    Entity, Asset, BoolSort())
+access_reviewed          = Function("access_reviewed",          Entity, Asset, BoolSort())
+physical_access_monitored = Function("physical_access_monitored", Entity, Asset, BoolSort())
+
+# Asset → Bool
+is_physical_asset        = Function("is_physical_asset",        Asset,  BoolSort())
+risk_assessed            = Function("risk_assessed",            Asset,  BoolSort())
+
+# Duty sort — supports concrete SoD modelling.  Uninterpreted in the baseline
+# reference model (no conflict pairs declared), which intentionally preserves
+# the Check 4 ambiguity signal until an agent-produced model registers duties.
+#
+# Entity × Asset × Duty → Bool
+duty_of        = Function("duty_of",        Entity, Asset, Duty, BoolSort())
+
+# Duty × Duty → Bool
+conflicts_with = Function("conflicts_with", Duty,   Duty,        BoolSort())
+
+# Quantifier variables — shared across all checks
+_e = Const("e", Entity)
+_a = Const("a", Asset)
+_d = Const("d", Duty)
+
+# The canonical model dict shape returned by both build_* functions.
+# Check functions receive this dict and reference predicates by key.
+_CANONICAL_MODEL_KEYS = {
+    "Entity": Entity, "Asset": Asset, "Duty": Duty, "e": _e, "a": _a, "d": _d,
+    "has_credentials": has_credentials,
+    "credentials_managed": credentials_managed,
+    "identity_proofed": identity_proofed,
+    "identity_bound": identity_bound,
+    "is_authenticated": is_authenticated,
+    "assertion_protected": assertion_protected,
+    "assertion_verified": assertion_verified,
+    "has_access": has_access,
+    "access_authorized": access_authorized,
+    "access_in_policy": access_in_policy,
+    "least_privilege_applied": least_privilege_applied,
+    "sep_of_duties_applied": sep_of_duties_applied,
+    "access_reviewed": access_reviewed,
+    "is_physical_asset": is_physical_asset,
+    "physical_access_monitored": physical_access_monitored,
+    "risk_assessed": risk_assessed,
+    "duty_of": duty_of,
+    "conflicts_with": conflicts_with,
+}
+
+
+# ── Production model: dynamic from Stage 2 SMT-LIB2 output ────────────────────
+
+def build_model(
+    formal: list[dict],
+    extra_axioms: list[Any] | None = None,
+) -> dict:
     """
-    Declares sorts, predicates, and requirement axioms for the PR.AA domain.
-    Returns a dict of all Z3 objects for use in checks.
+    Production path.  Builds the Z3 domain model by parsing the SMT-LIB2
+    strings produced by skill_02_formalizer for each selected requirement.
+
+    Each requirement's smt_lib2 field is parsed with z3.parse_smt2_string(),
+    which returns a list of Z3 assertion objects.  These become the axioms
+    the solver reasons over.
+
+    Because the canonical sorts (Entity, Asset) and predicate functions are
+    declared at module level, Z3 unifies them with any same-named declarations
+    inside the parsed SMT-LIB2 strings — so check functions can reference
+    predicates by their module-level Python variables as usual.
+
+    Args:
+        formal:       Stage 2 output list — one dict per requirement, each
+                      containing at minimum an "id" and "smt_lib2" field.
+        extra_axioms: Optional additional Z3 expressions to layer on top
+                      (additive only — existing axioms are never mutated).
+
+    Returns:
+        Model dict with the same shape as build_reference_model().
     """
-    # ── Sorts ──────────────────────────────────────────────────────────────────
-    # Entity covers users, services, and hardware (PR.AA-01, -02, -03)
-    Entity = DeclareSort("Entity")
-    Asset  = DeclareSort("Asset")
+    axioms: list[Any] = []
 
-    # ── Predicates (uninterpreted functions → Bool) ────────────────────────────
-    # Credential & identity (PR.AA-01, -02)
-    has_credentials          = Function("has_credentials",          Entity, BoolSort())
-    credentials_managed      = Function("credentials_managed",      Entity, BoolSort())
-    identity_proofed         = Function("identity_proofed",         Entity, BoolSort())
-    identity_bound           = Function("identity_bound",           Entity, BoolSort())
-    # Authentication (PR.AA-03)
-    is_authenticated         = Function("is_authenticated",         Entity, BoolSort())
-    # Identity assertions (PR.AA-04)
-    assertion_protected      = Function("assertion_protected",      Entity, BoolSort())
-    assertion_verified       = Function("assertion_verified",       Entity, BoolSort())
-    # Access control (PR.AA-05)
-    has_access               = Function("has_access",               Entity, Asset, BoolSort())
-    access_authorized        = Function("access_authorized",        Entity, Asset, BoolSort())
-    access_in_policy         = Function("access_in_policy",         Entity, Asset, BoolSort())
-    least_privilege_applied  = Function("least_privilege_applied",  Entity, Asset, BoolSort())
-    sep_of_duties_applied    = Function("sep_of_duties_applied",    Entity, Asset, BoolSort())
-    access_reviewed          = Function("access_reviewed",          Entity, Asset, BoolSort())
-    # Physical access (PR.AA-06)
-    is_physical_asset        = Function("is_physical_asset",        Asset,  BoolSort())
-    physical_access_monitored = Function("physical_access_monitored", Entity, Asset, BoolSort())
-    risk_assessed            = Function("risk_assessed",            Asset,  BoolSort())
+    for entry in formal:
+        req_id  = entry.get("id", "unknown")
+        smt_src = entry.get("smt_lib2", "").strip()
+        if not smt_src:
+            if True:  # always warn — empty SMT-LIB2 is unexpected
+                print(c(f"  ⚠️  {req_id}: smt_lib2 is empty — no axioms loaded for this requirement.", YELLOW))
+            continue
+        try:
+            parsed = parse_smt2_string(smt_src)
+            axioms.extend(parsed)
+        except Exception as exc:  # noqa: BLE001
+            print(c(f"  ⚠️  {req_id}: failed to parse SMT-LIB2 ({exc}). "
+                    "Skipping axioms for this requirement.", YELLOW))
 
-    # ── Quantifier variables ───────────────────────────────────────────────────
-    e = Const("e", Entity)
-    a = Const("a", Asset)
+    if extra_axioms:
+        axioms = axioms + list(extra_axioms)
 
-    # ── Requirement axioms ─────────────────────────────────────────────────────
-    # PR.AA-01: All entities with credentials have those credentials managed
+    return {**_CANONICAL_MODEL_KEYS, "axioms": axioms}
+
+
+# ── Regression/standalone model: hard-coded PR.AA axioms ──────────────────────
+
+def build_reference_model(extra_axioms: list[Any] | None = None) -> dict:
+    """
+    Regression/standalone path.  Hard-codes the six NIST PR.AA requirement
+    axioms directly in Python.  Used only when this module is executed
+    standalone (python skills/skill_03_smt_solver.py) so the solver can be
+    exercised without pipeline artefacts.
+
+    This model is intentionally designed to surface the known gaps (Checks 2,
+    3, 6) and ambiguities (Checks 4, 5) for educational purposes.  It is NOT
+    used in any end-to-end or production run — build_model() is used there.
+
+    Args:
+        extra_axioms: Optional additional Z3 expressions (additive only).
+
+    Returns:
+        Model dict with the same shape as build_model().
+    """
+    e, a = _e, _a
+
+    # PR.AA-01: all entities with credentials have those credentials managed
     ax_pr_aa_01 = ForAll(
         [e],
         Implies(has_credentials(e), credentials_managed(e)),
     )
 
-    # PR.AA-02: Credentials imply identity was proofed AND bound
+    # PR.AA-02: credentials imply identity was proofed AND bound
     ax_pr_aa_02 = ForAll(
         [e],
         Implies(
@@ -93,13 +219,13 @@ def build_model():
         ),
     )
 
-    # PR.AA-03: Access to any asset requires authentication
+    # PR.AA-03: access to any asset requires authentication
     ax_pr_aa_03 = ForAll(
         [e, a],
         Implies(has_access(e, a), is_authenticated(e)),
     )
 
-    # PR.AA-04: Authentication requires assertions are protected AND verified
+    # PR.AA-04: authentication requires assertions are protected AND verified
     ax_pr_aa_04 = ForAll(
         [e],
         Implies(
@@ -108,7 +234,7 @@ def build_model():
         ),
     )
 
-    # PR.AA-05: Access requires policy, authorisation, least privilege, SoD, review
+    # PR.AA-05: access requires policy, authorisation, least privilege, SoD, review
     ax_pr_aa_05 = ForAll(
         [e, a],
         Implies(
@@ -123,7 +249,7 @@ def build_model():
         ),
     )
 
-    # PR.AA-06: Physical asset access is monitored and the asset's risk is assessed
+    # PR.AA-06: physical asset access is monitored and the asset's risk is assessed
     ax_pr_aa_06 = ForAll(
         [e, a],
         Implies(
@@ -132,60 +258,80 @@ def build_model():
         ),
     )
 
-    axioms = [
+    axioms: list[Any] = [
         ax_pr_aa_01, ax_pr_aa_02, ax_pr_aa_03,
         ax_pr_aa_04, ax_pr_aa_05, ax_pr_aa_06,
     ]
 
-    return {
-        "Entity": Entity, "Asset": Asset, "e": e, "a": a,
-        "axioms": axioms,
-        # predicates
-        "has_credentials": has_credentials,
-        "credentials_managed": credentials_managed,
-        "identity_proofed": identity_proofed,
-        "identity_bound": identity_bound,
-        "is_authenticated": is_authenticated,
-        "assertion_protected": assertion_protected,
-        "assertion_verified": assertion_verified,
-        "has_access": has_access,
-        "access_authorized": access_authorized,
-        "access_in_policy": access_in_policy,
-        "least_privilege_applied": least_privilege_applied,
-        "sep_of_duties_applied": sep_of_duties_applied,
-        "access_reviewed": access_reviewed,
-        "is_physical_asset": is_physical_asset,
-        "physical_access_monitored": physical_access_monitored,
-        "risk_assessed": risk_assessed,
-    }
+    if extra_axioms:
+        axioms = axioms + list(extra_axioms)
+
+    return {**_CANONICAL_MODEL_KEYS, "axioms": axioms}
 
 
 # ── Checks ─────────────────────────────────────────────────────────────────────
+
 def _solver_with_axioms(axioms) -> Solver:
     s = Solver()
-    s.add(*axioms)
+    if axioms:
+        s.add(*axioms)
     return s
+
+
+def check_00_requirement_consistency(m: dict, req_ids: list[str]) -> dict:
+    """
+    CHECK 0 — Internal consistency of selected requirement(s).
+    Always runs regardless of scope.
+
+    Are the axioms derived from the selected requirement(s) simultaneously
+    satisfiable?  Expected: SAT — no requirement should contradict itself.
+
+    If UNSAT, the SHALL statements produced by Stage 1 and formalised in
+    Stage 2 contain a logical contradiction.  This is a critical finding
+    requiring the Stage 1 rewriting to be revised.
+    """
+    label = ", ".join(sorted(req_ids))
+    s = _solver_with_axioms(m["axioms"])
+    result = s.check()
+    if result == sat:
+        return {
+            "kind": "SAT",
+            "check": f"Internal consistency ({label})",
+            "detail": (
+                f"The axioms derived from {label} are satisfiable — "
+                "no self-contradiction exists within the selected requirement(s)."
+            ),
+        }
+    return {
+        "kind": "UNSAT",
+        "check": f"Internal consistency ({label})",
+        "detail": (
+            f"CRITICAL: the axioms for {label} are mutually contradictory. "
+            "No system could satisfy all SHALL statements simultaneously. "
+            "Review the Stage 1 rewriting for logical conflicts."
+        ),
+    }
 
 
 def check_01_global_consistency(m: dict) -> dict:
     """
-    CHECK 1 — Global Consistency
-    Are all six requirements simultaneously satisfiable?
-    Expected: SAT  (they are not contradictory with each other)
+    CHECK 1 — Global consistency across all selected requirements.
+    Are all selected requirement axioms simultaneously satisfiable?
+    Expected: SAT (they should not contradict each other).
     """
     s = _solver_with_axioms(m["axioms"])
     result = s.check()
     if result == sat:
         return {
             "kind": "SAT",
-            "check": "Global Consistency (all 6 requirements together)",
-            "detail": "All PR.AA-01 through PR.AA-06 axioms are simultaneously\n"
-                      "satisfiable — no internal contradiction exists across the set.",
+            "check": "Global Consistency (all selected requirements together)",
+            "detail": "All selected requirement axioms are simultaneously satisfiable — "
+                      "no internal contradiction exists across the set.",
         }
     return {
         "kind": "UNSAT",
-        "check": "Global Consistency (all 6 requirements together)",
-        "detail": f"UNEXPECTED: Requirements are mutually inconsistent. Z3 result: {result}",
+        "check": "Global Consistency (all selected requirements together)",
+        "detail": f"UNEXPECTED: selected requirements are mutually inconsistent. Z3 result: {result}",
     }
 
 
@@ -193,17 +339,16 @@ def check_02_authentication_credential_gap(m: dict) -> dict:
     """
     CHECK 2 — Gap: Authentication ↛ Credential Management
     Can an entity be authenticated WITHOUT having managed credentials?
+
     PR.AA-03 requires authentication for access.
     PR.AA-01 requires credential management.
-    But NEITHER requirement links them: no axiom says  is_authenticated → has_credentials.
+    The gap: neither requirement links them — no axiom asserts
+    is_authenticated(e) → has_credentials(e).
 
-    Expected: SAT  (the gap exists — authentication is possible without managed credentials)
-    Finding: ⚠️ GAP — services or hardware can be authenticated via certificates or tokens
-             without those credentials appearing in the organisation's credential inventory.
+    Expected: SAT (gap exists — closed only when the linking axiom is present)
     """
     e = m["e"]
     s = _solver_with_axioms(m["axioms"])
-    # Assert a counterexample: e is authenticated but has no credentials
     s.add(m["is_authenticated"](e))
     s.add(Not(m["has_credentials"](e)))
     result = s.check()
@@ -226,18 +371,16 @@ def check_02_authentication_credential_gap(m: dict) -> dict:
 def check_03_access_to_identity_proofing_chain(m: dict) -> dict:
     """
     CHECK 3 — Gap: Access ↛ Identity Proofing
-    Does 'has_access' guarantee identity was proofed (PR.AA-02)?
+    Does has_access(e, a) guarantee identity_proofed(e)?
 
-    Chain as written:  has_access → is_authenticated  (PR.AA-03)
+    Chain as written:  has_access → is_authenticated       (PR.AA-03)
                        has_credentials → identity_proofed  (PR.AA-02)
-    Missing link:      is_authenticated → has_credentials  (not in any requirement)
+    Missing link:      is_authenticated → has_credentials  (no requirement asserts this)
 
-    Therefore:  has_access does NOT guarantee identity_proofed.
-    Expected:   SAT (gap — the chain is broken)
+    Expected: SAT (gap — chain is broken; closed when the linking axiom is present)
     """
     e, a = m["e"], m["a"]
     s = _solver_with_axioms(m["axioms"])
-    # Assert: entity has access but identity was never proofed
     s.add(m["has_access"](e, a))
     s.add(Not(m["identity_proofed"](e)))
     result = s.check()
@@ -253,61 +396,66 @@ def check_03_access_to_identity_proofing_chain(m: dict) -> dict:
         }
     return {
         "kind": "SAT",
-        "check": "Access → Identity Proofing chain is complete.",
+        "check": "PR.AA-03 + PR.AA-02: Access → Identity Proofing chain is complete.",
         "detail": "No gap found.",
     }
 
 
-def check_04_separation_of_duties_undefined(m: dict) -> dict:
+def check_04_separation_of_duties(m: dict) -> dict:
     """
-    CHECK 4 — Ambiguity: Separation of Duties is an unconstrained predicate
-    PR.AA-05 asserts sep_of_duties_applied(e, a) for all access,
-    but the model contains NO axiom defining what sep_of_duties_applied means
-    or what it entails.  Z3 treats it as vacuously satisfiable.
+    CHECK 4 — Ambiguity: Separation of Duties has no registered conflict pairs.
 
-    Finding: 🔍 AMBIGUITY — SoD is required but never formally defined.
+    Asks: given has_access(e, a), can the conflicts_with register be entirely
+    empty?  In the baseline reference model it can (SAT → AMBIGUITY), because
+    no duty pairs are declared and sep_of_duties_applied is vacuously asserted.
+
+    Once an agent-produced model adds a definitional axiom linking
+    sep_of_duties_applied to duty_of/conflicts_with (i.e. access requires at
+    least one registered conflict pair), the combined assertion becomes
+    contradictory (UNSAT → resolved).
+
+    Expected outcome progression:
+      baseline / no Duty axioms  →  SAT    (AMBIGUITY)
+      with duty_of/conflicts_with definitional axiom  →  UNSAT  (resolved)
     """
     e, a = m["e"], m["a"]
-    s = _solver_with_axioms(m["axioms"])
-    # Can sep_of_duties_applied be True AND False for different entities simultaneously?
-    e2 = Const("e2", m["Entity"])
-    a2 = Const("a2", m["Asset"])
-    s.add(m["sep_of_duties_applied"](e, a))
-    s.add(Not(m["sep_of_duties_applied"](e2, a2)))
+    d1   = Const("d1", m["Duty"])
+    d2   = Const("d2", m["Duty"])
+    s    = _solver_with_axioms(m["axioms"])
+    s.add(m["has_access"](e, a))
+    s.add(ForAll([d1, d2], Not(m["conflicts_with"](d1, d2))))
     result = s.check()
     if result == sat:
         return {
             "kind": "AMBIGUITY",
             "check": "PR.AA-05: Separation of Duties — undefined predicate",
-            "detail": "sep_of_duties_applied is simultaneously True for one (entity, asset)\n"
-                      "pair and False for another, with no contradiction.\n"
+            "detail": "The conflicts_with register can be empty even when access is granted.\n"
+                      "No duty pairs have been formally defined — sep_of_duties_applied is vacuous.\n"
                       "The requirement states SoD must be incorporated but never defines:\n"
                       "  • What constitutes a 'duty'\n"
-                      "  • How many principals are required for separation\n"
-                      "  • What actions conflict and must be separated\n"
-                      "Recommendation: add sub-requirements defining SoD criteria.",
+                      "  • Which duty combinations conflict\n"
+                      "  • That at least one conflict pair must exist for any guarded access\n"
+                      "Recommendation: add duty_of/conflicts_with axioms defining the conflict register.",
         }
     return {
-        "kind": "SAT",
+        "kind": "UNSAT",
         "check": "PR.AA-05: Separation of Duties",
-        "detail": "SoD predicate is consistent.",
+        "detail": "Conflict register is required — the model cannot satisfy has_access "
+                  "without at least one conflicts_with pair.  SoD ambiguity resolved.",
     }
 
 
 def check_05_physical_logical_access_boundary(m: dict) -> dict:
     """
-    CHECK 5 — Ambiguity: Physical access and PR.AA-05 policy scope
+    CHECK 5 — Ambiguity: Physical/Logical access boundary between PR.AA-05 and PR.AA-06.
     PR.AA-05 requires access_in_policy for all has_access.
-    PR.AA-06 adds monitoring for physical assets.
+    PR.AA-06 addresses physical access separately.
 
-    But: is 'has_access' in PR.AA-05 the same predicate covering physical assets?
-    In this model, YES — has_access is universal.
-    However, the natural language of PR.AA-05 ('logical access') vs PR.AA-06
-    ('physical access') implies they may be separate — but the text doesn't say so.
+    In a unified model (has_access covers both), PR.AA-05 applies to physical assets
+    and the check returns UNSAT.  But implementations that split has_access into
+    separate logical/physical predicates will create a gap.
 
-    Check: can a physical asset be accessed without being in policy?
-    With our model: UNSAT (good — PR.AA-05 covers it)
-    BUT: if organisations model them as separate predicates, the gap re-appears.
+    Expected: UNSAT in a unified model (which surfaces the ambiguity)
     """
     e, a = m["e"], m["a"]
     s = _solver_with_axioms(m["axioms"])
@@ -336,18 +484,17 @@ def check_05_physical_logical_access_boundary(m: dict) -> dict:
 
 def check_06_full_access_guarantee_chain(m: dict) -> dict:
     """
-    CHECK 6 — Implication chain: What does 'has_access' truly guarantee?
-    This traces the complete chain of guarantees flowing from has_access(e, a):
+    CHECK 6 — Implication chain: what does has_access truly guarantee?
 
-      has_access(e,a) →  [PR.AA-03]  is_authenticated(e)
-                      →  [PR.AA-04]  assertion_protected(e) ∧ assertion_verified(e)
-                      →  [PR.AA-05]  access_in_policy ∧ access_authorized ∧ least_privilege ∧ ...
-                      →  [PR.AA-06]  (if physical) physical_access_monitored ∧ risk_assessed
+    Traces the complete chain from has_access(e, a):
+      → is_authenticated          (PR.AA-03)
+      → assertion_protected/verified (PR.AA-04)
+      → access_in_policy, access_authorized, least_privilege,
+        sep_of_duties, access_reviewed  (PR.AA-05)
+      → physical_access_monitored, risk_assessed  (PR.AA-06, if physical)
 
-    NOT guaranteed (because of gap from check_02 and check_03):
-      has_access does NOT guarantee: has_credentials, credentials_managed, identity_proofed
-
-    We test: does has_access imply credentials_managed? Expected: SAT (not guaranteed = gap)
+    Tests whether has_access → credentials_managed.
+    Expected: SAT (gap — closed when the full chain is bridged)
     """
     e, a = m["e"], m["a"]
     s = _solver_with_axioms(m["axioms"])
@@ -373,73 +520,154 @@ def check_06_full_access_guarantee_chain(m: dict) -> dict:
         }
     return {
         "kind": "SAT",
-        "check": "Access chain is complete.",
-        "detail": "has_access implies credentials_managed.",
+        "check": "Full access guarantee chain: has_access → credentials_managed",
+        "detail": "has_access implies credentials_managed — the full chain is intact.",
     }
 
 
-# ── Orchestrator ───────────────────────────────────────────────────────────────
+# ── Check registry ─────────────────────────────────────────────────────────────
+
 CHECKS = [
     check_01_global_consistency,
     check_02_authentication_credential_gap,
     check_03_access_to_identity_proofing_chain,
-    check_04_separation_of_duties_undefined,
+    check_04_separation_of_duties,
     check_05_physical_logical_access_boundary,
     check_06_full_access_guarantee_chain,
 ]
 
-CHECK_REQUIREMENT_MAP = {
+# Maps each check to the frozenset of requirement IDs that must ALL be in
+# scope for the check to run.  A check is skipped when any of its required
+# requirement IDs are not in the selected set.
+CHECK_REQUIREMENT_MAP: dict = {
+    check_01_global_consistency:                frozenset({"PR.AA-01", "PR.AA-02", "PR.AA-03", "PR.AA-04", "PR.AA-05", "PR.AA-06"}),
+    check_02_authentication_credential_gap:     frozenset({"PR.AA-01", "PR.AA-03"}),
+    check_03_access_to_identity_proofing_chain: frozenset({"PR.AA-02", "PR.AA-03"}),
+    check_04_separation_of_duties:              frozenset({"PR.AA-05"}),
+    check_05_physical_logical_access_boundary:  frozenset({"PR.AA-05", "PR.AA-06"}),
+    check_06_full_access_guarantee_chain:       frozenset({"PR.AA-01", "PR.AA-02", "PR.AA-03", "PR.AA-04", "PR.AA-05", "PR.AA-06"}),
+}
+
+# Human-readable scope labels used for terminal display only.
+CHECK_DISPLAY_LABEL: dict = {
     check_01_global_consistency:                "PR.AA-01 – PR.AA-06",
     check_02_authentication_credential_gap:     "PR.AA-01 × PR.AA-03",
     check_03_access_to_identity_proofing_chain: "PR.AA-02 × PR.AA-03",
-    check_04_separation_of_duties_undefined:    "PR.AA-05",
+    check_04_separation_of_duties:              "PR.AA-05",
     check_05_physical_logical_access_boundary:  "PR.AA-05 × PR.AA-06",
     check_06_full_access_guarantee_chain:       "PR.AA-01 – PR.AA-06",
 }
 
 
-def run(formal: list[dict] | None = None, verbose: bool = True) -> list[dict]:
+# ── Orchestrator ───────────────────────────────────────────────────────────────
+
+def run(
+    formal: list[dict] | None = None,
+    verbose: bool = True,
+    extra_axioms: list[Any] | None = None,
+    previous_findings: dict[str, str] | None = None,
+    selected_req_ids: list[str] | None = None,
+) -> list[dict]:
     """
-    Runs all Z3 checks against the PR.AA domain model.
+    Runs Z3 checks against the domain model for the selected requirements.
 
     Args:
-        formal:  Output from skill_02_formalizer.run() — used to display
-                 SMT-LIB2 snippets alongside results (optional, display only)
-        verbose: If True, prints formatted output to terminal
+        formal:            Stage 2 output list.  When provided, the model is
+                           built dynamically from the SMT-LIB2 strings
+                           (production path).  When None, build_reference_model()
+                           is used (standalone/regression path).
+        verbose:           If True, prints formatted output to terminal.
+        extra_axioms:      Optional additional Z3 expressions (additive only).
+        previous_findings: Optional dict mapping check name → prior kind string.
+                           When supplied, each result is annotated with a
+                           before/after indicator so the audience can track
+                           which checks changed across remediation passes.
+        selected_req_ids:  List of requirement IDs selected by the user (e.g.
+                           ["PR.AA-01"]).  Only checks whose required scope is
+                           a subset of this list are run.  When None, all
+                           checks run (backwards-compatible default).
 
     Returns:
-        List of finding dicts  {kind, check, detail}
+        List of finding dicts  {kind, check, detail}.
+        check_00 (internal consistency) is always the first entry.
     """
-    model = build_model()
+    # Build the domain model
+    if formal is not None:
+        model = build_model(formal, extra_axioms=extra_axioms)
+    else:
+        model = build_reference_model(extra_axioms=extra_axioms)
+
+    # Determine the effective selected set for check filtering
+    if selected_req_ids is not None:
+        selected = frozenset(selected_req_ids)
+    else:
+        # Default: treat all known requirement IDs as selected (run all checks)
+        selected = frozenset().union(*CHECK_REQUIREMENT_MAP.values())
 
     if verbose and formal:
         _print_smt_lib2_reference(formal)
 
-    findings = []
+    findings: list[dict] = []
+
+    # Check 0 — always runs; label uses the selected IDs
+    req_ids_for_label = sorted(selected_req_ids) if selected_req_ids else sorted(selected)
+    finding_0 = check_00_requirement_consistency(model, req_ids_for_label)
+    findings.append(finding_0)
+    if verbose:
+        print(c(f"  Check 0  ·  scope: {', '.join(req_ids_for_label)}", DIM))
+        prior_kind = (
+            previous_findings.get(finding_0["check"])
+            if previous_findings else None
+        )
+        print_finding(
+            finding_0["kind"],
+            finding_0["check"],
+            finding_0.get("detail", ""),
+            previous_kind=prior_kind,
+        )
+
+    # Checks 1–N — filtered to those whose scope ⊆ selected
+    skipped = 0
     for i, check_fn in enumerate(CHECKS, 1):
+        required_scope = CHECK_REQUIREMENT_MAP.get(check_fn, frozenset())
+        if not required_scope.issubset(selected):
+            skipped += 1
+            continue
+
         finding = check_fn(model)
         findings.append(finding)
 
         if verbose:
-            req_scope = CHECK_REQUIREMENT_MAP.get(check_fn, "")
-            print(c(f"  Check {i}  ·  scope: {req_scope}", DIM))
+            label = CHECK_DISPLAY_LABEL.get(check_fn, "")
+            print(c(f"  Check {i}  ·  scope: {label}", DIM))
+            prior_kind = (
+                previous_findings.get(finding["check"])
+                if previous_findings else None
+            )
             print_finding(
                 finding["kind"],
                 finding["check"],
                 finding.get("detail", ""),
+                previous_kind=prior_kind,
             )
+
+    if verbose and skipped:
+        print(c(
+            f"  {skipped} check(s) skipped — their required requirements are not all in scope.\n"
+            f"  To run them, include the additional requirement IDs with --requirements.",
+            DIM,
+        ))
+        print()
 
     return findings
 
 
 def _print_smt_lib2_reference(formal: list[dict]):
-    """
-    Display a condensed SMT-LIB2 reference from skill_02 so engineers can
-    see the connection between the displayed logic and the solver.
-    """
-    print(c("  SMT-LIB2 from Stage 2 (reference — solver uses Z3 Python API):", BOLD))
+    """Display a condensed SMT-LIB2 reference so the audience can see the
+    connection between the Stage 2 formal output and the Z3 axioms."""
+    print(c("  SMT-LIB2 from Stage 2 (parsed by Z3 to build the domain model):", BOLD))
     print()
-    for f in formal[:2]:  # Show first two to keep output digestible
+    for f in formal[:2]:  # show first two to keep output digestible
         label = f"{f['id']} SMT-LIB2 snippet"
         snippet_lines = f.get("smt_lib2", "").strip().split("\n")[:8]
         snippet = "\n".join(snippet_lines)
@@ -454,14 +682,16 @@ def _print_smt_lib2_reference(formal: list[dict]):
     print()
 
 
-# ── Standalone entry point ─────────────────────────────────────────────────────
+# ── Standalone entry point — uses build_reference_model() ─────────────────────
 if __name__ == "__main__":
     from utils.terminal import print_summary
 
     print_stage(
         3,
-        "SMT SOLVING  (Z3)",
-        "Running automated reasoning proofs against the PR.AA formal model",
+        "SMT SOLVING  (Z3)  [standalone / regression mode]",
+        "Using build_reference_model() — hard-coded PR.AA axioms, all checks",
     )
-    findings = run(formal=None, verbose=True)
+    # Pass formal=None so run() falls back to build_reference_model()
+    # and selected_req_ids=None so all checks run.
+    findings = run(formal=None, verbose=True, selected_req_ids=None)
     print_summary(findings)

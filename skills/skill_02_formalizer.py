@@ -9,6 +9,10 @@ parallel formal representations:
 
 Can be run standalone (calls skill_01 first automatically):
     python skills/skill_02_formalizer.py
+
+Output is also written to .opencode/pipeline/stage2_output.json so that
+an OpenCode agent run can produce it without a direct API call, and
+run.py --from-files can consume it.
 """
 
 import os
@@ -17,6 +21,10 @@ import json
 import anthropic
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Project root resolved from this file's location — used by _save_output()
+# so that writing to .opencode/pipeline/ is CWD-independent.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from utils.terminal import (
     c, BOLD, CYAN, DIM, YELLOW, GREEN, WHITE,
@@ -51,6 +59,51 @@ You MUST respond with a JSON array. Each element has this exact shape:
   "predicates_used": ["has_credentials", ...]
 }
 
+CANONICAL VOCABULARY — you MUST use only these sort and predicate names.
+Introduce a new name only when no existing predicate covers the concept,
+following the same snake_case convention and the exact type signatures shown.
+Any name you introduce must not clash with an existing one.
+
+Sorts:
+  Entity   — users, services, and hardware
+  Asset    — physical or logical resources
+  Duty     — a discrete, named action or role that can conflict with another duty
+
+Predicates (Entity → Bool):
+  has_credentials, credentials_managed, identity_proofed, identity_bound,
+  is_authenticated, assertion_protected, assertion_verified
+
+Predicates (Entity × Asset → Bool):
+  has_access, access_authorized, access_in_policy, least_privilege_applied,
+  sep_of_duties_applied, access_reviewed, physical_access_monitored
+
+Predicates (Entity × Asset × Duty → Bool):
+  duty_of        — entity e holds duty d over asset a
+
+Predicates (Duty × Duty → Bool):
+  conflicts_with — duties d1 and d2 are designated as conflicting
+
+Predicates (Asset → Bool):
+  is_physical_asset, risk_assessed
+
+For PR.AA-05 specifically: sep_of_duties_applied(e, a) MUST be given a definitional
+axiom in terms of duty_of and conflicts_with.  It is not sufficient to merely assert
+sep_of_duties_applied — you must add a forall axiom of the form:
+  ∀ (e: Entity) (a: Asset): sep_of_duties_applied(e, a) →
+    ∃ (d1: Duty) (d2: Duty) (e2: Entity):
+      duty_of(e, a, d1) ∧ duty_of(e2, a, d2) ∧ conflicts_with(d1, d2) ∧ e ≠ e2
+
+In SMT-LIB2 this looks like:
+  (assert (forall ((e Entity) (a Asset))
+    (=> (sep_of_duties_applied e a)
+        (exists ((d1 Duty) (d2 Duty) (e2 Entity))
+          (and (duty_of e a d1)
+               (duty_of e2 a d2)
+               (conflicts_with d1 d2)
+               (not (= e e2)))))))
+
+This makes the conflict register non-vacuous and allows Check 4 to resolve.
+
 Return ONLY valid JSON. No markdown fences. No commentary."""
 
 
@@ -77,6 +130,9 @@ def run(rewritten: list[dict], nist_data: dict, verbose: bool = True) -> list[di
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print(c("  ERROR: ANTHROPIC_API_KEY environment variable not set.", BOLD))
+        print(c("  To run without an API key, use the OpenCode 'run-pipeline' skill", DIM))
+        print(c("  (OpenCode handles the LLM call) then run:  python run.py --from-files", DIM))
+        print(c("  Or run offline:  python run.py --no-llm", DIM))
         sys.exit(1)
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -106,10 +162,25 @@ def run(rewritten: list[dict], nist_data: dict, verbose: bool = True) -> list[di
 
     formal = json.loads(raw)
 
+    _save_output(formal)
+
     if verbose:
         _print_results(rewritten, formal)
 
     return formal
+
+
+def _save_output(formal: list[dict]):
+    """Persist stage 2 output to .opencode/pipeline/ for --from-files consumption.
+
+    Uses _PROJECT_ROOT (resolved from this file's location) so that the output
+    path is correct regardless of the current working directory.
+    """
+    out_dir = os.path.join(_PROJECT_ROOT, ".opencode", "pipeline")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "stage2_output.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(formal, fh, indent=2, ensure_ascii=False)
 
 
 def _print_results(rewritten: list[dict], formal: list[dict]):

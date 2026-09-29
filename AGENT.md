@@ -1,5 +1,5 @@
 # AGENT.md — Requirements Engine
-## Claude Code Orchestration Guide
+## OpenCode Orchestration Guide
 
 This agent orchestrates a four-stage cybersecurity requirements analysis pipeline
 against NIST CSF 2.0 outcomes. Each stage is a discrete, independently runnable skill.
@@ -14,11 +14,11 @@ NIST Requirements (data/requirements.py)
         ▼  Stage 0
    Display raw NIST PR.AA outcomes
         │
-        ▼  Stage 1  [skill_01_rewriter.py]
-   Claude API: rewrite vague language → precise testable SHALL statements
+        ▼  Stage 1  [skill_01_rewriter.py  OR  OpenCode agent]
+   Rewrite vague language → precise testable SHALL statements
         │
-        ▼  Stage 2  [skill_02_formalizer.py]
-   Claude API: translate criteria → pseudo-logic (∀ →) + SMT-LIB2
+        ▼  Stage 2  [skill_02_formalizer.py  OR  OpenCode agent]
+   Translate criteria → pseudo-logic (∀ →) + SMT-LIB2
         │
         ▼  Stage 3  [skill_03_smt_solver.py]
    Z3 Python API: run proofs → surface gaps, ambiguities, contradictions
@@ -31,20 +31,39 @@ NIST Requirements (data/requirements.py)
 
 ## Commands
 
-### Full pipeline (requires ANTHROPIC_API_KEY)
+### Full pipeline — OpenCode-native (preferred, no API key required)
+
+When running inside OpenCode (e.g. GitHub Copilot or any other configured model),
+the agent itself performs stages 1 and 2. Load the `run-pipeline` skill for the
+detailed workflow. In brief:
+
+1. Read `data/requirements.py` and apply the prompts in `skills/skill_01_rewriter.py`
+   using your own model. Write output to `.opencode/pipeline/stage1_output.json`.
+2. Apply the prompts in `skills/skill_02_formalizer.py` using the stage 1 output.
+   Write output to `.opencode/pipeline/stage2_output.json`.
+3. Run the Z3 solver against the pre-computed files:
+
+```bash
+python run.py --from-files
+```
+
+### Full pipeline — direct API path (requires ANTHROPIC_API_KEY)
+
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 python run.py
 ```
 
 ### Offline demo — Z3 only, no API calls
+
 ```bash
 python run.py --no-llm
 ```
 
 ### Run a single skill in isolation
+
 ```bash
-# Skill 1 only — rewrite requirements
+# Skill 1 only — rewrite requirements (requires ANTHROPIC_API_KEY when run standalone)
 python skills/skill_01_rewriter.py
 
 # Skill 2 only — formalise (runs skill 1 as prerequisite automatically)
@@ -61,9 +80,10 @@ python skills/skill_03_smt_solver.py
 When asked to run or extend this pipeline, the agent should:
 
 ### Task: Run the full pipeline
-1. Check for ANTHROPIC_API_KEY in environment
-2. Run `python run.py`
-3. Capture and display output
+1. Load the `run-pipeline` OpenCode skill for the full workflow
+2. Perform stages 1 & 2 using the agent's own model (write JSON to `.opencode/pipeline/`)
+3. Run `python run.py --from-files`
+4. Capture and display output
 
 ### Task: Run Z3 solver only (offline demo)
 1. Run `python run.py --no-llm`
@@ -95,9 +115,13 @@ When asked to run or extend this pipeline, the agent should:
 
 ## Dependency Notes
 
-- `anthropic>=0.25.0` — Claude API client
+- `anthropic>=0.25.0` — Claude API client (used by skill_01/skill_02 for the direct API path)
 - `z3-solver>=4.12.0` — SMT solver (Z3)
 - Python 3.11+ recommended (uses `list[dict] | None` union syntax)
+
+The `anthropic` package is only exercised when `ANTHROPIC_API_KEY` is set and
+`python run.py` is called without `--from-files` or `--no-llm`. When running
+via OpenCode, the agent handles LLM calls and the package is not invoked.
 
 Install with:
 ```bash
@@ -128,9 +152,14 @@ requirements-engine/
 ├── data/
 │   └── requirements.py         ← NIST PR.AA source data
 ├── skills/
-│   ├── skill_01_rewriter.py    ← Stage 1: LLM rewriting
-│   ├── skill_02_formalizer.py  ← Stage 2: Formal logic generation
+│   ├── skill_01_rewriter.py    ← Stage 1: LLM rewriting (or OpenCode agent)
+│   ├── skill_02_formalizer.py  ← Stage 2: Formal logic generation (or OpenCode agent)
 │   └── skill_03_smt_solver.py  ← Stage 3: Z3 proofs
+├── .opencode/
+│   ├── skills/run-pipeline/    ← OpenCode skill: full pipeline workflow
+│   └── pipeline/               ← intermediate JSON output (gitignored)
+│       ├── stage1_output.json  ← produced by agent or skill_01 direct run
+│       └── stage2_output.json  ← produced by agent or skill_02 direct run
 └── utils/
     └── terminal.py             ← ANSI display helpers
 ```

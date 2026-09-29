@@ -6,6 +6,10 @@ testable SHALL statements using the Anthropic Claude API.
 
 Can be run standalone:
     python skills/skill_01_rewriter.py
+
+Output is also written to .opencode/pipeline/stage1_output.json so that
+an OpenCode agent run can produce it without a direct API call, and
+run.py --from-files can consume it.
 """
 
 import os
@@ -15,6 +19,10 @@ import anthropic
 
 # ── Allow standalone execution from project root ─────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Project root resolved from this file's location — used by _save_output()
+# so that writing to .opencode/pipeline/ is CWD-independent.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from utils.terminal import (
     c, BOLD, CYAN, DIM, YELLOW, MAGENTA, BLUE, GREEN,
@@ -75,6 +83,9 @@ def run(nist_data: dict, verbose: bool = True) -> list[dict]:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print(c("  ERROR: ANTHROPIC_API_KEY environment variable not set.", BOLD))
+        print(c("  To run without an API key, use the OpenCode 'run-pipeline' skill", DIM))
+        print(c("  (OpenCode handles the LLM call) then run:  python run.py --from-files", DIM))
+        print(c("  Or run offline:  python run.py --no-llm", DIM))
         sys.exit(1)
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -107,10 +118,25 @@ def run(nist_data: dict, verbose: bool = True) -> list[dict]:
 
     rewritten = json.loads(raw)
 
+    _save_output(rewritten)
+
     if verbose:
         _print_results(nist_data, rewritten)
 
     return rewritten
+
+
+def _save_output(rewritten: list[dict]):
+    """Persist stage 1 output to .opencode/pipeline/ for --from-files consumption.
+
+    Uses _PROJECT_ROOT (resolved from this file's location) so that the output
+    path is correct regardless of the current working directory.
+    """
+    out_dir = os.path.join(_PROJECT_ROOT, ".opencode", "pipeline")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "stage1_output.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(rewritten, fh, indent=2, ensure_ascii=False)
 
 
 def _print_results(nist_data: dict, rewritten: list[dict]):
